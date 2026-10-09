@@ -13,6 +13,8 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import io.emx.core.DriverPayload
+import io.emx.term.PtyRunner
+import io.emx.term.TerminalEmulator
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -20,9 +22,15 @@ import java.util.Locale
 
 /**
  * Landscape-first setup screen. Shows device compatibility, driver payload
- * status and a log view. The Android Back key toggles the soft keyboard
- * when the log/terminal area has focus (text-entry context); otherwise
- * standard navigation behavior applies.
+ * status and a log view that can be swapped for a live terminal (PTY) via a
+ * "Start terminal" button; the log/terminal area is toggled back and forth
+ * with a small toolbar button.
+ *
+ * Back key behavior:
+ *  - Terminal visible and focused → toggle the soft keyboard (hide if shown,
+ *    show if hidden) — the product requirement for the terminal milestone.
+ *  - Log view focused (text-entry context) → same toggle.
+ *  - Otherwise → default activity navigation.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -30,6 +38,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var logScroller: ScrollView
     private lateinit var statusView: TextView
     private lateinit var actionButton: Button
+    private lateinit var startTerminalButton: Button
+    private lateinit var toggleViewButton: Button
+    private lateinit var terminalHost: LinearLayout
+    private var terminalView: TerminalView? = null
+    private var ptyRunner: PtyRunner? = null
+    private var showLogInsteadOfTerminal = true
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -76,12 +90,23 @@ class MainActivity : AppCompatActivity() {
             text = "Extract driver payload"
             setOnClickListener { extractDriver() }
         }
+        startTerminalButton = Button(this).apply {
+            text = "Start terminal"
+            setOnClickListener { startTerminal() }
+        }
+        toggleViewButton = Button(this).apply {
+            text = "Show log"
+            visibility = View.GONE
+            setOnClickListener { toggleLogTerminal() }
+        }
         left.addView(title)
         left.addView(subtitle)
         left.addView(statusView)
         left.addView(actionButton)
+        left.addView(startTerminalButton)
+        left.addView(toggleViewButton)
 
-        // Right panel: log view (the future terminal area)
+        // Right panel: log view by default; the terminal swaps in over it.
         logScroller = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.58f)
             isFillViewport = true
@@ -101,14 +126,36 @@ class MainActivity : AppCompatActivity() {
             false
         }
 
+        // The terminal host occupies the same slot as the log scroller; only
+        // one of them is visible at a time (toggled by toggleViewButton).
+        terminalHost = LinearLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.58f)
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setBackgroundColor(0xFF000000.toInt())
+        }
+
         root.addView(left)
         root.addView(logScroller)
+        root.addView(terminalHost)
         return root
     }
 
+    @Deprecated("Deprecated in API 33, still needed for minSdk 26")
     override fun onBackPressed() {
         val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
-        if (logView.hasWindowFocus() && imm.isActive(logView) && logView.hasFocus()) {
+        val term = terminalView
+        // Terminal is the priority context for the Back-toggles-keyboard product rule.
+        if (!showLogInsteadOfTerminal && term != null && term.hasFocus()) {
+            if (imm.isAcceptingText && imm.isActive(term)) {
+                imm.hideSoftInputFromWindow(term.windowToken, 0)
+            } else {
+                term.requestFocus()
+                imm.showSoftInput(term, InputMethodManager.SHOW_IMPLICIT)
+            }
+            return
+        }
+        if (showLogInsteadOfTerminal && logView.hasWindowFocus() && imm.isActive(logView) && logView.hasFocus()) {
             // Text-entry context: Back toggles the soft keyboard.
             if (imm.isAcceptingText) imm.hideSoftInputFromWindow(logView.windowToken, 0)
             else showKeyboard()
@@ -121,6 +168,81 @@ class MainActivity : AppCompatActivity() {
         val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
         logView.requestFocus()
         imm.showSoftInput(logView, InputMethodManager.SHOW_IMPLICIT)
+    }
+
+    /** Launch (or reveal) the terminal over the log area and start the PTY runner. */
+    private fun startTerminal() {
+        if (terminalView == null) {
+            // Create the terminal view and emulator sized for the available space.
+            val host = terminalHost
+            host.post {
+                val width = host.width
+                val height = host.height
+                val paint = android.graphics.Paint().apply {
+                    typeface = android.graphics.Typeface.MONOSPACE
+                    textSize = 14f * resources.displayMetrics.scaledDensity
+                }
+                val cw = paint.measureText("M")
+                val ch = (paint.fontMetrics.descent - paint.fontMetrics.ascent).coerceAtLeast(paint.textSize)
+                val cols = (width / cw).toInt().coerceAtLeast(20)
+                val rows = (height / ch).toInt().coerceAtLeast(4)
+                val emulator = TerminalEmulator(cols, rows)
+                val view = TerminalView(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    attach(emulator)
+                    isFocusable = true
+                    isFocusableInTouchMode = true
+                }
+                host.addView(view)
+                terminalView = view
+                startPtyRunner(view, emulator)
+                toggleLogTerminal()
+            }
+        } else {
+            // Already created; just show it (and restart the runner if it died).
+            val view = terminalView!!
+            if (ptyRunner?.isRunning != true) {
+                startPtyRunner(view, view.emulator)
+            }
+            if (showLogInsteadOfTerminal) toggleLogTerminal()
+        }
+    }
+
+    /**
+     * Start the PTY runner. Runs `/system/bin/sh -i` with a real PTY when
+     * `Os.openpty` is available; falls back to pipes when it is not.
+     */
+    private fun startPtyRunner(view: TerminalView, emulator: TerminalEmulator) {
+        val runner = PtyRunner(
+            command = listOf("/system/bin/sh", "-i"),
+            workingDir = filesDir,
+            onOutput = { data, len -> view.feed(data, len) },
+            onExit = { code -> log("terminal exited with code $code") }
+        )
+        ptyRunner = runner
+        if (!runner.start()) {
+            log("failed to start terminal process")
+        } else {
+            log("terminal started (${if (runner.usingPty) "PTY" else "pipes"} mode)")
+        }
+    }
+
+    /** Swap between the log view and the terminal view in the right panel. */
+    private fun toggleLogTerminal() {
+        showLogInsteadOfTerminal = !showLogInsteadOfTerminal
+        if (showLogInsteadOfTerminal) {
+            terminalHost.visibility = View.GONE
+            logScroller.visibility = View.VISIBLE
+            toggleViewButton.text = "Show terminal"
+        } else {
+            logScroller.visibility = View.GONE
+            terminalHost.visibility = View.VISIBLE
+            toggleViewButton.text = "Show log"
+            terminalView?.requestFocus()
+        }
+        toggleViewButton.visibility = View.VISIBLE
     }
 
     private fun logDeviceCheck() {
@@ -192,6 +314,11 @@ class MainActivity : AppCompatActivity() {
                 status()
             }
         }.start()
+    }
+
+    override fun onDestroy() {
+        ptyRunner?.stop()
+        super.onDestroy()
     }
 
     private fun log(msg: String) {
