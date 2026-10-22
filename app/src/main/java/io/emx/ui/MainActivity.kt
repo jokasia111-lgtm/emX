@@ -125,12 +125,21 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
     }
 
     private fun showHelp() {
-        val instructions = "Install Termux and Termux:X11 from their official sources, then open Termux once.\n\nIn ~/.termux/termux.properties set:\nallow-external-apps=true\n\nRun termux-reload-settings and return to emX. Grant the run-command permission when prompted. Only grant this permission to apps you trust: it permits commands inside Termux.\n\nSetup uses the current proot-distro OCI CLI (--name); update Termux packages if your version does not support it. Linux and graphics sessions run in Termux, not the Android diagnostic shell. Termux may need its documented background/display permissions to show a new session."
+        val instructions = """
+            Install Termux (F-Droid) and Termux:X11, open Termux once, then run:
+
+            pkg upgrade -y
+            mkdir -p ~/.termux
+            echo allow-external-apps=true >> ~/.termux/termux.properties
+            termux-reload-settings
+
+            Return to emX and allow the run-command prompt. That permission lets an app run commands inside Termux, so grant it only to apps you trust.
+
+            emX installs proot-distro, curl, unzip and util-linux itself and needs proot-distro 5.x. The Android diagnostic shell cannot reach Termux; run these in Termux.
+        """.trimIndent()
         AlertDialog.Builder(this).setTitle("Connect Termux").setMessage(instructions)
             .setPositiveButton("Open Termux") { _, _ -> openPackage(TermuxBridge.PACKAGE) }
-            .setNeutralButton("Copy instructions") { _, _ ->
-                getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Termux setup", instructions))
-            }.setNegativeButton("Close", null).show()
+            .setNegativeButton("Close", null).show()
     }
 
     private fun requestOperation(operation: String) {

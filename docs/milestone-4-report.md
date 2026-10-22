@@ -2,11 +2,13 @@
 
 ## Status
 
-Code complete and host-verified. **Nothing in this milestone is proven on
-hardware**: no device or AVD was available, so install, Vulkan enumeration and
-visual rendering remain unverified. The APK builds, the host test suite passes,
-and the CLI formats the runtime script depends on were confirmed against
-upstream sources rather than guessed.
+Code complete and host-verified, and now **partially proven on real hardware**
+(Samsung SM-S901B / Exynos s5e9925 / arm64-v8a): the `RUN_COMMAND` dispatch was
+accepted, the script ran under Termux's `bash`, and `proot-distro 5.10.1` plus
+`curl`, `unzip`, `util-linux` were installed by it. Setup then failed at the
+driver download because that partial package upgrade left `curl` unable to link
+— see "First hardware run". Container install, driver loading, Vulkan
+enumeration and visual rendering remain unverified.
 
 ## Scope change from the plan
 
@@ -119,6 +121,33 @@ A successful `RUN_COMMAND` dispatch is also recorded as *dispatch*, not
 5. JNI reads used `ReleaseByteArrayElements` with `JNI_ABORT`, discarding the
    bytes just read from the PTY master.
 6. Terminal input was rendered locally instead of being written to the child.
+7. Termux reports `Activity.RESULT_OK` (-1) in the result bundle's `err` key for
+   a delivered command, but `RuntimeResultReceiver` required `err == 0` and so
+   could reject a run that actually succeeded. `err` is now printed for
+   information only; exit code plus the per-operation markers decide.
+8. The setup script's `pkg install` upgraded `curl` past a stale `libopenssl`
+   and broke it. `libopenssl` is now installed in the same transaction, and the
+   script probes `curl --version` before downloading — on failure it upgrades
+   `libopenssl`, then all packages, and only then gives up with an instruction.
+
+## First hardware run
+
+Observed on a Samsung SM-S901B (`s5e9925`, arm64-v8a) from the in-app log:
+
+- Proven working: `RUN_COMMAND` dispatch accepted, `allow-external-apps` and the
+  permission grant, the script executing under Termux `bash`, mirror selection
+  and `apt` update, and the package install (`proot-distro 5.10.1`, `proot
+  5.1.107.98`, `curl`/`libcurl 8.23.0`, `util-linux 2.42.4`, `unzip 6.0-10`,
+  `libandroid-shmem 0.7`, `libtalloc 2.5.0`, `libngtcp2 1.25.0`). The `flock`
+  and free-space checks passed.
+- Failure: at "Receiving the bundled driver from emX...", Termux reported
+  `CANNOT LINK EXECUTABLE "curl": cannot locate symbol
+  "SSL_set_quic_tls_early_data_enabled" referenced by ".../lib/libcurl.so"`,
+  because the device had 74 outdated packages and `pkg install` upgraded `curl`
+  but not `libopenssl`. Exit 1, setup correctly not confirmed. Fixed by bugs 7
+  and 8 above, which came from this log rather than from speculation.
+- Also exposed: `Termux setup: exit=1, API error=-1` showed the `err` gate of
+  bug 7 in the message text.
 
 ## Build evidence
 
@@ -143,10 +172,16 @@ lintDebug`, Gradle 8.9 / AGP 8.7.3 / JDK 17, Windows host):
   `app-release-unsigned.apk` and never falls back to the debug key; a partial
   variable set fails `validateReleaseSigningEnvironment`.
 
+This evidence predates bugs 7 and 8. The machine's only JDK is now 25.0.3, which
+Gradle 8.9 refuses to run on, so those changes are verified by the GitHub
+Actions build (JDK 17) rather than locally, and `bash -n` on the script is clean.
+
 ## Not verified
 
-- Any Termux interaction: `RUN_COMMAND` acceptance, `allow-external-apps`,
-  permission prompt behavior, session visibility.
+- Termux interaction past the package install: the payload download, container
+  creation and result-bundle delivery are now partly proven (dispatch,
+  permission grant and `pkg install` succeeded on hardware), but the loopback
+  `curl` fetch and `sha256sum -c` on-device have never completed.
 - `proot-distro install -n emx-debian debian:bookworm` actually resolving and
   unpacking, and the guest `apt-get` dependency set installing.
 - Driver loading, `vulkaninfo` output on Xclipse, `VK_ICD_FILENAMES` handling

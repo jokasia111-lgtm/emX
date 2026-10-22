@@ -27,9 +27,21 @@ setup)
     case "$url" in http://127.0.0.1:*) ;; *) fail 'Invalid local payload address.' ;; esac
     mkdir -p "$state"
     printf '%s\n' 'Installing Termux runtime packages...'
-    pkg install -y proot-distro curl unzip util-linux
+    # libopenssl is listed so curl is never upgraded past its SSL library.
+    pkg install -y proot-distro curl unzip util-linux libopenssl
     command -v proot-distro >/dev/null || fail 'proot-distro installation failed.'
     command -v flock >/dev/null || fail 'util-linux installation failed; flock is required.'
+    # A stale libopenssl leaves curl unable to link, which is Termux's most
+    # common partial-upgrade breakage; fix it before relying on the download.
+    if ! curl --version >/dev/null 2>&1; then
+        printf '%s\n' 'Termux curl cannot link; upgrading libopenssl...'
+        pkg upgrade -y libopenssl
+        if ! curl --version >/dev/null 2>&1; then
+            printf '%s\n' 'Still broken; upgrading all Termux packages...'
+            pkg upgrade -y
+        fi
+        curl --version >/dev/null 2>&1 || fail 'curl is still broken. In Termux run: pkg upgrade -y'
+    fi
     exec 9>"$state/setup.lock"
     flock -n 9 || fail 'An emX installation is already running in Termux.'
     available=$(df -P "$HOME" | tail -n 1 | tr -s ' ' | cut -d' ' -f4)

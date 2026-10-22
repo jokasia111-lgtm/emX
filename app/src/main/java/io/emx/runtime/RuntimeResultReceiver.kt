@@ -16,9 +16,11 @@ class RuntimeResultReceiver : BroadcastReceiver() {
         val stderr = result?.getString("stderr").orEmpty()
         val error = result?.getString("errmsg").orEmpty()
         val exit = result?.getInt("exitCode", -1) ?: -1
-        val apiError = result?.getInt("err", 0) ?: -1
-        var success = exit == 0 && apiError == 0
-        var message = "Termux $operation: exit=$exit, API error=$apiError\n$stdout\n$stderr\n$error"
+        val apiError = result?.getInt("err", 0) ?: 0
+        // Termux sends Activity.RESULT_OK (-1) in "err" for a delivered command, so
+        // only the exit code and the per-operation markers below decide success.
+        var success = exit == 0
+        var message = "Termux $operation: exit=$exit, Termux result=$apiError\n$stdout\n$stderr\n$error"
         when (operation) {
             "setup" -> {
                 success = success && stdout.lineSequence().any { it.trim() == "EMX_SETUP_OK:${DriverPayload.ZIP_SHA256}" }
