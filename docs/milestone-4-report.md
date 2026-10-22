@@ -4,11 +4,12 @@
 
 Code complete and host-verified, and now **partially proven on real hardware**
 (Samsung SM-S901B / Exynos s5e9925 / arm64-v8a): the `RUN_COMMAND` dispatch was
-accepted, the script ran under Termux's `bash`, and `proot-distro 5.10.1` plus
-`curl`, `unzip`, `util-linux` were installed by it. Setup then failed at the
-driver download because that partial package upgrade left `curl` unable to link
-— see "First hardware run". Container install, driver loading, Vulkan
-enumeration and visual rendering remain unverified.
+accepted and the runtime script ran under Termux's `bash`, installing
+`proot-distro 5.10.1`, `curl`, `unzip` and `util-linux`. Neither of the two
+recorded runs has reached the driver download — both died on a Termux package set
+that `pkg` itself could not repair. See "Hardware runs on the SM-S901B".
+Container install, driver loading, Vulkan enumeration and visual rendering remain
+unverified.
 
 ## Scope change from the plan
 
@@ -125,29 +126,45 @@ A successful `RUN_COMMAND` dispatch is also recorded as *dispatch*, not
    a delivered command, but `RuntimeResultReceiver` required `err == 0` and so
    could reject a run that actually succeeded. `err` is now printed for
    information only; exit code plus the per-operation markers decide.
-8. The setup script's `pkg install` upgraded `curl` past a stale `libopenssl`
-   and broke it. `libopenssl` is now installed in the same transaction, and the
-   script probes `curl --version` before downloading — on failure it upgrades
-   `libopenssl`, then all packages, and only then gives up with an instruction.
+8. Package work used Termux's `pkg`, which broke twice over on the same device:
+   first `pkg install` upgraded `curl` past a stale `libopenssl` and left `curl`
+   unlinkable, then the *repair* could not run because `pkg` itself shells out to
+   `curl`. The script now uses `apt-get` throughout (`update`, `install` with
+   `libopenssl` in the same transaction, and a `full-upgrade` heal if `curl
+   --version` still fails), and `x11-setup` switched too. `apt`/`pkg` wrappers are
+   avoided entirely because they need curl; `apt-get` does not.
+9. The setup instructions told the user to repair Termux with `pkg upgrade -y`,
+   which fails for the same reason. They now say `apt update && apt full-upgrade -y`.
 
-## First hardware run
+## Hardware runs on the SM-S901B
 
-Observed on a Samsung SM-S901B (`s5e9925`, arm64-v8a) from the in-app log:
+Two real-device runs (`s5e9925`, arm64-v8a), logged through the in-app status view.
 
-- Proven working: `RUN_COMMAND` dispatch accepted, `allow-external-apps` and the
-  permission grant, the script executing under Termux `bash`, mirror selection
-  and `apt` update, and the package install (`proot-distro 5.10.1`, `proot
-  5.1.107.98`, `curl`/`libcurl 8.23.0`, `util-linux 2.42.4`, `unzip 6.0-10`,
-  `libandroid-shmem 0.7`, `libtalloc 2.5.0`, `libngtcp2 1.25.0`). The `flock`
-  and free-space checks passed.
-- Failure: at "Receiving the bundled driver from emX...", Termux reported
-  `CANNOT LINK EXECUTABLE "curl": cannot locate symbol
-  "SSL_set_quic_tls_early_data_enabled" referenced by ".../lib/libcurl.so"`,
-  because the device had 74 outdated packages and `pkg install` upgraded `curl`
-  but not `libopenssl`. Exit 1, setup correctly not confirmed. Fixed by bugs 7
-  and 8 above, which came from this log rather than from speculation.
-- Also exposed: `Termux setup: exit=1, API error=-1` showed the `err` gate of
-  bug 7 in the message text.
+**Run 1 (`1e0dc40` build).** Proven working: `RUN_COMMAND` dispatch accepted,
+`allow-external-apps` and the permission grant, the script executing under Termux
+`bash`, mirror selection, `apt` update, and the package install
+(`proot-distro 5.10.1`, `proot 5.1.107.98`, `curl`/`libcurl 8.23.0`,
+`util-linux 2.42.4`, `unzip 6.0-10`, `libandroid-shmem 0.7`, `libtalloc 2.5.0`,
+`libngtcp2 1.25.0`), plus the `flock` and free-space checks. It then died at
+"Receiving the bundled driver from emX..." with
+`CANNOT LINK EXECUTABLE "curl": cannot locate symbol
+"SSL_set_quic_tls_early_data_enabled"`: the device had 74 outdated packages and
+`pkg install` moved `curl` without moving `libopenssl`. Exit 1, setup correctly
+not confirmed. `API error=-1` in the same line exposed bug 7.
+
+**Run 2 (`4814c8c` build).** The receiver fix is confirmed live — the status line
+now reads `Termux result=-1`. The script still failed, earlier than before:
+`Installing Termux runtime packages...` produced only
+`No mirror or mirror group selected...` followed by the same `CANNOT LINK` error
+and `Failed to run the 'curl' command.` Run 1 had already left Termux's `curl`
+broken, and `pkg` needs `curl` to test mirrors, so package work could not start
+at all. The in-script heal was positioned *after* `pkg install` and itself called
+`pkg` — dead code against the exact failure it targeted. This is what produced
+bugs 8 and 9.
+
+Neither run has yet reached the payload download, so `curl` fetching from the
+loopback server, `sha256sum -c`, container install and the guest `apt-get` remain
+unproven on hardware.
 
 ## Build evidence
 

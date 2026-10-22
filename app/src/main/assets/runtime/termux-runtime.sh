@@ -26,21 +26,20 @@ setup)
     test "${#digest}" = 64 || fail 'Driver checksum is invalid.'
     case "$url" in http://127.0.0.1:*) ;; *) fail 'Invalid local payload address.' ;; esac
     mkdir -p "$state"
+    # Termux's pkg wrapper shells out to curl, so it cannot be used to repair a
+    # partial upgrade that broke curl; apt does not need curl, so all package
+    # work here goes through apt-get directly.
+    printf '%s\n' 'Updating Termux package lists...'
+    apt-get update
     printf '%s\n' 'Installing Termux runtime packages...'
     # libopenssl is listed so curl is never upgraded past its SSL library.
-    pkg install -y proot-distro curl unzip util-linux libopenssl
+    apt-get install -y proot-distro curl unzip util-linux libopenssl
     command -v proot-distro >/dev/null || fail 'proot-distro installation failed.'
     command -v flock >/dev/null || fail 'util-linux installation failed; flock is required.'
-    # A stale libopenssl leaves curl unable to link, which is Termux's most
-    # common partial-upgrade breakage; fix it before relying on the download.
     if ! curl --version >/dev/null 2>&1; then
-        printf '%s\n' 'Termux curl cannot link; upgrading libopenssl...'
-        pkg upgrade -y libopenssl
-        if ! curl --version >/dev/null 2>&1; then
-            printf '%s\n' 'Still broken; upgrading all Termux packages...'
-            pkg upgrade -y
-        fi
-        curl --version >/dev/null 2>&1 || fail 'curl is still broken. In Termux run: pkg upgrade -y'
+        printf '%s\n' 'Termux curl cannot link; upgrading the whole package set...'
+        apt-get full-upgrade -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+        curl --version >/dev/null 2>&1 || fail 'curl is still broken. In Termux run: apt update && apt full-upgrade -y'
     fi
     exec 9>"$state/setup.lock"
     flock -n 9 || fail 'An emX installation is already running in Termux.'
@@ -89,8 +88,9 @@ shell)
     ;;
 x11-setup)
     require_runtime
-    pkg install -y x11-repo
-    pkg install -y termux-x11-nightly
+    apt-get install -y x11-repo
+    apt-get update
+    apt-get install -y termux-x11-nightly
     printf '%s\n' EMX_X11_TOOLS_OK
     ;;
 cube)

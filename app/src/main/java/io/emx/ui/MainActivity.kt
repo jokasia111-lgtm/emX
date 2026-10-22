@@ -128,14 +128,15 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         val instructions = """
             Install Termux (F-Droid) and Termux:X11, open Termux once, then run:
 
-            pkg upgrade -y
             mkdir -p ~/.termux
             echo allow-external-apps=true >> ~/.termux/termux.properties
             termux-reload-settings
 
+            If Termux reports unupgraded packages, also run: apt update && apt full-upgrade -y
+
             Return to emX and allow the run-command prompt. That permission lets an app run commands inside Termux, so grant it only to apps you trust.
 
-            emX installs proot-distro, curl, unzip and util-linux itself and needs proot-distro 5.x. The Android diagnostic shell cannot reach Termux; run these in Termux.
+            Repair with apt, not pkg: Termux's pkg needs curl, and a half-upgraded Termux breaks curl. emX installs proot-distro, curl, unzip and util-linux itself and needs proot-distro 5.x. The Android diagnostic shell cannot reach Termux; run these in Termux.
         """.trimIndent()
         AlertDialog.Builder(this).setTitle("Connect Termux").setMessage(instructions)
             .setPositiveButton("Open Termux") { _, _ -> openPackage(TermuxBridge.PACKAGE) }
