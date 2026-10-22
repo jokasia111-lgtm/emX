@@ -1,40 +1,41 @@
 package io.emx.term
 
-/**
- * Minimal JNI bridge to the native PTY shim (app/src/main/c/emxpty.c).
- *
- * Exists because Java cannot hand ProcessBuilder an arbitrary fd for a
- * child's stdin/stdout, and `android.system.Os.openpty` is hidden from the
- * public SDK. The native side uses forkpty(3): the parent keeps the master
- * fd; the child gets the slave as fds 0/1/2 and execs directly.
- */
+/** JNI transport for a local Android child, not a remote or Linux-container session. */
 object NativePty {
     init {
         System.loadLibrary("emxnative")
     }
 
+    const val CHILD_RUNNING = -65536
+    const val WOULD_BLOCK = -11 // Android EAGAIN; read/write have a bounded poll timeout.
+
     /**
-     * Fork + exec [program] with [args] over a fresh PTY. On success fills
-     * [pidOut] with {pid, 0} and [masterOut] with {masterFd}.
-     * Returns 0 on success, -1 on failure.
+     * Exec an absolute [program] path with a complete [environment] (NAME=value).
+     * Success: 0, pidOut={pid,0}, masterOut={fd}. Failure: -1, pidOut={-1,errno}.
+     * chdir/exec failures are reported before returning, and failed children reaped.
      */
     external fun forkExec(
         program: String, args: Array<String>, workingDir: String?,
-        rows: Int, cols: Int,
+        environment: Array<String>, rows: Int, cols: Int,
         pidOut: IntArray, masterOut: IntArray,
     ): Int
 
-    /** Read from the PTY master fd. Returns byte count or -1 (errno). */
+    /** Byte count, 0 for EOF, or negative errno (including [WOULD_BLOCK]). */
     external fun readMaster(master: Int, buf: ByteArray, off: Int, len: Int): Int
 
-    /** Write to the PTY master fd. Returns byte count or -1 (errno). */
+    /** Partial byte count or negative errno (including [WOULD_BLOCK]). */
     external fun writeMaster(master: Int, buf: ByteArray, off: Int, len: Int): Int
 
+    /** TIOCSWINSZ also delivers SIGWINCH to the foreground process group. */
+    external fun resizeMaster(master: Int, cols: Int, rows: Int): Int
     external fun closeMaster(master: Int)
 
+    /** Only the owner of an unreaped child may call this, never after waitChild succeeds. */
+    external fun terminateChild(pid: Int)
+
     /**
-     * Reap [pid] if it has exited (WNOHANG). Returns 0 if still running,
-     * 128+exitCode on exit, 128+signal on signal death, -1 on error.
+     * Reap exactly [pid]. Normal exit: 0..255; signal: 128+signal; error: negative errno.
+     * Blocking by default. With [noHang], [CHILD_RUNNING] is distinct from exit 0.
      */
-    external fun waitChild(pid: Int): Int
+    external fun waitChild(pid: Int, noHang: Boolean = false): Int
 }

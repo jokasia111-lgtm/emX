@@ -7,3 +7,13 @@ build/
 captures/
 .externalNativeBuild
 .cxx
+
+# Local signing material and configuration
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+*.local.properties
+.env
+.env.*
+!.env.example

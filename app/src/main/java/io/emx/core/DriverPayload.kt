@@ -40,49 +40,31 @@ object DriverPayload {
     private fun sha256(file: File): String =
         file.inputStream().use { sha256(it) }
 
-    /**
-     * Applies the ZIP's Unix permission bits (owner/group/other rwx) exactly.
-     * java.io.File only exposes owner permissions, so POSIX-mode application
-     * is done via android.system.Os on device; on JVM tests the equivalent
-     * is achieved with java.nio. Returns true when the exact mode could be
-     * applied and verified.
-     */
     fun applyMode(out: File, mode: Int): Boolean {
-        val owner = (mode ushr 6) and 7
-        val group = (mode ushr 3) and 7
-        val other = mode and 7
         return try {
-            // Owner bits via java.io.File
-            out.setReadable(owner and 4 != 0, true)
-            out.setWritable(owner and 2 != 0, true)
-            out.setExecutable(owner and 1 != 0, true)
-            // Full exact mode via POSIX attribute view when available (JVM
-            // and Android both support it; Android's implementation maps to
-            // the same owner-only setters plus group/other via Posix).
-            val path = out.toPath()
-            val view = java.nio.file.Files.getFileAttributeView(path, java.nio.file.attribute.PosixFileAttributeView::class.java)
-            if (view != null) {
-                val perms = java.nio.file.attribute.PosixFilePermissions.fromString(
-                    buildString {
-                        for (shift in intArrayOf(6, 3, 0)) {
-                            val bits = (mode ushr shift) and 7
-                            append(if (bits and 4 != 0) 'r' else '-'); append(if (bits and 2 != 0) 'w' else '-'); append(if (bits and 1 != 0) 'x' else '-')
-                        }
+            val view = java.nio.file.Files.getFileAttributeView(
+                out.toPath(), java.nio.file.attribute.PosixFileAttributeView::class.java,
+            ) ?: return false
+            val permissions = java.nio.file.attribute.PosixFilePermissions.fromString(
+                buildString {
+                    for (shift in intArrayOf(6, 3, 0)) {
+                        val bits = (mode ushr shift) and 7
+                        append(if (bits and 4 != 0) 'r' else '-')
+                        append(if (bits and 2 != 0) 'w' else '-')
+                        append(if (bits and 1 != 0) 'x' else '-')
                     }
-                )
-                view.setPermissions(perms)
-            }
-            // verify actual mode where the filesystem reports it
-            val actual = readActualMode(out)
-            actual == -1 || actual == mode // -1: mode unreadable (e.g. some Android fs); accept silently
-        } catch (t: Throwable) {
+                }
+            )
+            view.setPermissions(permissions)
+            readActualMode(out) == mode
+        } catch (_: Exception) {
             false
         }
     }
 
     /** Returns the file's 0xFFF mode bits, or -1 if they cannot be read. */
     fun readActualMode(out: File): Int {
-        return try {
+        try {
             val path = out.toPath()
             val view = java.nio.file.Files.getFileAttributeView(path, java.nio.file.attribute.PosixFileAttributeView::class.java)
             val attrs = view?.readAttributes() ?: return -1

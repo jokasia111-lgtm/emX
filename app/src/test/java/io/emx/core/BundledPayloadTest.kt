@@ -23,12 +23,16 @@ class BundledPayloadTest {
 
     @Test
     fun bundledZipHashMatches() {
-        assertEquals(DriverPayload.ZIP_SHA256, DriverPayload.sha256(bundledZip().inputStream()))
+        bundledZip().inputStream().use {
+            assertEquals(DriverPayload.ZIP_SHA256, DriverPayload.sha256(it))
+        }
     }
 
     @Test
     fun extractionProducesExpectedLayout() {
         val tmp = createTempDir(prefix = "emxreal")
+        org.junit.Assume.assumeTrue("Exact Unix modes require a POSIX filesystem",
+            java.nio.file.Files.getFileStore(tmp.toPath()).supportsFileAttributeView("posix"))
         val result = bundledZip().inputStream().use { DriverPayload.extract(it, File(tmp, "d")) }
         assertEquals(5, result.entries.size)
 

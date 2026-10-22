@@ -30,17 +30,42 @@ class TerminalEmulator(
         private val COLOR_MAP = intArrayOf(0, 1, 2, 3, 4, 5, 6, 7)
     }
 
+    init {
+        require(cols > 0 && rows > 0) { "Terminal dimensions must be positive" }
+        require(scrollbackLimit >= 0) { "Scrollback limit must not be negative" }
+    }
+
     private var curCols = cols
     private var curRows = rows
     private var screen: Array<Array<Cell>> = Array(rows) { Array(cols) { Cell() } }
-    private val scrollback = ArrayDeque<MutableList<Cell>>() // each element is one full row
-    /** Lines appended to scrollback since the last poll; the renderer consumes these. */
-    private val pendingScrollback = ArrayDeque<MutableList<Cell>>()
-
-    var cursorRow: Int = 0
+    private val scrollback = ArrayDeque<List<Cell>>()
+    /** Kept bounded even when no renderer polls it. */
+    private val pendingScrollback = ArrayDeque<List<Cell>>()
+    var scrolledLines: Long = 0
         private set
+    var historyGeneration: Long = 0
+        private set
+
+    /** History is owned here, not duplicated in the view. Cells/rows are immutable. */
+    fun scrollbackLine(index: Int): List<Cell> = scrollback[index]
+    fun scrollbackRowCount(): Int = scrollback.size
+
+    private fun rememberLine(line: List<Cell>) {
+        if (scrollback.size >= scrollbackLimit) scrollback.removeFirst()
+        scrollback.addLast(line)
+        if (pendingScrollback.size >= scrollbackLimit) pendingScrollback.removeFirst()
+        pendingScrollback.addLast(line)
+        scrolledLines++
+    }
+
+    var cursorRow: Int
+        get() = cursorRowValue
+        private set(value) { cursorRowValue = value; wrapPending = false }
+    private var cursorRowValue = 0
     var cursorCol: Int = 0
         private set
+    /** VT100 autowrap delay: the next graphic char, not this one, starts the next line. */
+    private var wrapPending = false
     private var savedRow = 0
     private var savedCol = 0
     private var savedFg = DEFAULT_FG
@@ -59,12 +84,12 @@ class TerminalEmulator(
     private enum class ParseState { GROUND, ESC, CSI, OSC }
     private var state = ParseState.GROUND
     private val csiParams = StringBuilder()
-    private val oscBuffer = StringBuilder()
 
     // ------------------------------------------------------------------ API
 
-    /** Append raw bytes from the process. Non-ASCII bytes are passed through. */
+    /** Append process bytes (this small emulator currently renders printable ASCII). */
     fun write(data: ByteArray, len: Int = data.size) {
+        require(len in 0..data.size) { "Invalid byte count" }
         for (i in 0 until len) {
             val b = data[i].toInt() and 0xFF
             writeChar(b.toChar())
@@ -93,6 +118,7 @@ class TerminalEmulator(
         for (r in 0 until curRows) for (c in 0 until curCols) screen[r][c] = Cell()
         scrollback.clear()
         pendingScrollback.clear()
+        historyGeneration++
         cursorRow = 0
         cursorCol = 0
         dirty = true
@@ -101,34 +127,30 @@ class TerminalEmulator(
     /** Reset all attributes and content. */
     fun reset() {
         fg = DEFAULT_FG; bg = DEFAULT_BG; bold = false
+        savedRow = 0; savedCol = 0
+        savedFg = DEFAULT_FG; savedBg = DEFAULT_BG; savedBold = false
         clear()
         state = ParseState.GROUND
         csiParams.setLength(0)
     }
 
-    /** Resize the grid. Simple reflow: keeps the last [newRows] lines, drops the rest. */
+    /** No text reflow: shrinking keeps the latest rows, moving discarded rows to history. */
     fun resize(newCols: Int, newRows: Int) {
+        require(newCols > 0 && newRows > 0) { "Terminal dimensions must be positive" }
         if (newCols == curCols && newRows == curRows) return
-        // Extract current text rows (top-to-bottom).
-        val oldLines = ArrayList<MutableList<Cell>>(curRows)
-        for (r in 0 until curRows) {
-            val line = ArrayList<Cell>(curCols)
-            for (c in 0 until curCols) line.add(screen[r][c])
-            oldLines.add(line)
-        }
-        // Build the new grid with the last newRows lines (bottom-aligned).
+        val droppedRows = (curRows - newRows).coerceAtLeast(0)
+        for (r in 0 until droppedRows) rememberLine(screen[r].toList())
         val newScreen = Array(newRows) { Array(newCols) { Cell() } }
-        val src = oldLines.takeLast(newRows)
-        var r = newRows - src.size
-        for (line in src) {
-            for (c in 0 until minOf(newCols, line.size)) newScreen[r][c] = line[c]
-            r++
+        for (r in 0 until minOf(curRows, newRows)) {
+            for (c in 0 until minOf(curCols, newCols)) newScreen[r][c] = screen[r + droppedRows][c]
         }
         curCols = newCols
         curRows = newRows
         screen = newScreen
-        cursorRow = cursorRow.coerceAtMost(newRows - 1)
+        cursorRow = (cursorRow - droppedRows).coerceIn(0, newRows - 1)
         cursorCol = cursorCol.coerceAtMost(newCols - 1)
+        savedRow = (savedRow - droppedRows).coerceIn(0, newRows - 1)
+        savedCol = savedCol.coerceAtMost(newCols - 1)
         dirty = true
     }
 
@@ -136,8 +158,6 @@ class TerminalEmulator(
     fun rowText(r: Int): String = buildString {
         for (c in 0 until curCols) append(screen[r][c].ch)
     }
-
-    fun scrollbackRowCount(): Int = scrollback.size
 
     // ------------------------------------------------------------------ parser
 
@@ -170,7 +190,7 @@ class TerminalEmulator(
                     state = ParseState.GROUND
                     dirty = true
                 }
-                ']' -> { state = ParseState.OSC; oscBuffer.setLength(0) }
+                ']' -> state = ParseState.OSC
                 'M' -> { // RI: scroll down
                     if (cursorRow == 0) scrollDown() else cursorRow--
                     state = ParseState.GROUND
@@ -179,7 +199,7 @@ class TerminalEmulator(
                 else -> state = ParseState.GROUND
             }
             ParseState.CSI -> when (ch) {
-                in '0'..'9', ';', '?' -> csiParams.append(ch)
+                in '0'..'9', ';', '?' -> if (csiParams.length < 256) csiParams.append(ch)
                 else -> {
                     handleCsi(ch)
                     state = ParseState.GROUND
@@ -188,7 +208,7 @@ class TerminalEmulator(
             ParseState.OSC -> when (ch.code) {
                 0x07 -> state = ParseState.GROUND
                 0x1B -> state = ParseState.ESC
-                else -> oscBuffer.append(ch)
+                else -> {} // Titles are ignored, not accumulated without a bound.
             }
         }
     }
@@ -311,21 +331,24 @@ class TerminalEmulator(
     // ------------------------------------------------------------------ writes
 
     private fun printChar(ch: Char) {
-        if (cursorCol >= curCols) {
+        if (wrapPending) {
             cursorCol = 0
             if (cursorRow == curRows - 1) scrollUp() else cursorRow++
         }
         screen[cursorRow][cursorCol] = Cell(ch, fg, bg, bold)
         cursorCol++
+        if (cursorCol >= curCols) {
+            cursorCol = curCols - 1
+            wrapPending = true
+        }
         dirty = true
     }
 
     private fun scrollUp() {
+        wrapPending = false
         val row = ArrayList<Cell>(curCols)
         for (c in 0 until curCols) row.add(screen[0][c])
-        if (scrollback.size >= scrollbackLimit) scrollback.removeFirst()
-        scrollback.addLast(row)
-        pendingScrollback.addLast(row)
+        rememberLine(row)
         for (r in 1 until curRows) {
             for (c in 0 until curCols) screen[r - 1][c] = screen[r][c]
         }
@@ -333,6 +356,7 @@ class TerminalEmulator(
     }
 
     private fun scrollDown() {
+        wrapPending = false
         for (r in curRows - 1 downTo 1) {
             for (c in 0 until curCols) screen[r][c] = screen[r - 1][c]
         }

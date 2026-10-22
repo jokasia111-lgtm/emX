@@ -13,279 +13,260 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import io.emx.term.TerminalEmulator
+import io.emx.term.TerminalKeys
 import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.math.abs
 import kotlin.math.max
 
-/**
- * Canvas-based terminal renderer.
- *
- * Displays a [TerminalEmulator] on a monospace grid. Handles:
- *  - rendering cells with per-cell fg/bg colors
- *  - cursor (blinking block)
- *  - scrollback (swipe up/down over the view)
- *  - soft keyboard text input via [onCreateInputConnection]
- *
- * Redraw strategy: post invalidations when the emulator reports [TerminalEmulator.dirty]
- * or when scroll offset changes. A background thread feeds the emulator; this view
- * must only touch it on the UI thread, so writes go through a queue drained in
- * a post() callback.
- *
- * Product requirement: when this view has focus, the Back key toggles the soft
- * keyboard (hide if shown, show if hidden). View.onKeyDown cannot consume the
- * Back key reliably on all API levels, so that behavior lives in
- * [MainActivity.onBackPressed]; this view just needs to be focusable so the
- * activity can detect the terminal context.
- */
+/** PTY renderer and input surface; history is owned by [TerminalEmulator]. */
 class TerminalView(context: Context) : View(context) {
-
     companion object {
-        // ANSI palette (0-7). Default fg is palette[7] (white), bg palette[0] (black).
         private val PALETTE = intArrayOf(
-            Color.parseColor("#000000"), // 0 black
-            Color.parseColor("#cd3131"), // 1 red
-            Color.parseColor("#0dbc79"), // 2 green
-            Color.parseColor("#e5e510"), // 3 yellow
-            Color.parseColor("#2472c8"), // 4 blue
-            Color.parseColor("#bc3fbc"), // 5 magenta
-            Color.parseColor("#11a8cd"), // 6 cyan
-            Color.parseColor("#e5e5e5")  // 7 white
+            Color.parseColor("#000000"), Color.parseColor("#cd3131"),
+            Color.parseColor("#0dbc79"), Color.parseColor("#e5e510"),
+            Color.parseColor("#2472c8"), Color.parseColor("#bc3fbc"),
+            Color.parseColor("#11a8cd"), Color.parseColor("#e5e5e5"),
         )
         private const val CURSOR_BLINK_MS = 530L
     }
 
-    /** The emulator backing this view. Set before the view is attached. */
+    var onInput: ((ByteArray) -> Unit)? = null
+    var onResize: ((cols: Int, rows: Int) -> Unit)? = null
     lateinit var emulator: TerminalEmulator
 
-    private val paint = Paint().apply {
-        typeface = Typeface.MONOSPACE
-        isAntiAlias = false // crisp terminal look
-    }
-    private val bgPaint = Paint()
-
-    /** Pending bytes from the process reader thread; drained on the UI thread. */
+    private val paint = Paint().apply { typeface = Typeface.MONOSPACE; isAntiAlias = false }
+    private val backgroundPaint = Paint()
     private val pendingInput = ConcurrentLinkedQueue<ByteArray>()
     private val inputLock = Any()
-
-    private var charWidth = 0f
-    private var charHeight = 0f
+    private var charWidth = 1f
+    private var charHeight = 1f
     private var fontAscent = 0f
-
-    /** Scrollback offset in lines (0 = live view). Populated but not yet
-     *  gesture-driven; a later milestone should wire touch scrolling to this. */
     private var scrollOffset = 0
-    private val scrollbackLines = ArrayList<List<TerminalEmulator.Cell>>()
-
     private var cursorVisible = true
-    private val blinkRunnable = object : Runnable {
+    private var touchDownY = 0f
+    private var lastTouchY = 0f
+    private var dragging = false
+    private val touchSlop = 10f * resources.displayMetrics.density
+    private val inputMethodManager =
+        context.getSystemService(InputMethodManager::class.java)
+
+    private val blink = object : Runnable {
         override fun run() {
             cursorVisible = !cursorVisible
-            if (scrollOffset == 0) invalidate()
+            if (scrollOffset == 0 && hasFocus()) invalidate()
             postDelayed(this, CURSOR_BLINK_MS)
         }
     }
 
-    fun attach(emulator: TerminalEmulator) {
-        this.emulator = emulator
-        recomputeMetrics()
+    init {
+        isFocusable = true
+        isFocusableInTouchMode = true
     }
 
-    /** Feed raw bytes from the process reader thread (thread-safe). */
+    fun attach(emulator: TerminalEmulator) {
+        this.emulator = emulator
+        scrollOffset = 0
+        recomputeMetrics()
+        invalidate()
+    }
+
+    fun resetView() {
+        scrollOffset = 0
+        invalidate()
+    }
+
     fun feed(data: ByteArray, len: Int) {
-        synchronized(inputLock) {
-            pendingInput.add(if (len == data.size) data else data.copyOf(len))
-        }
+        if (len <= 0) return
+        synchronized(inputLock) { pendingInput.add(data.copyOf(len)) }
         post { drainInput() }
     }
 
-    /** Drain pending input into the emulator; must run on UI thread. */
     private fun drainInput() {
+        if (!::emulator.isInitialized) return
         synchronized(inputLock) {
             while (true) {
-                val chunk = pendingInput.poll() ?: break
-                emulator.write(chunk)
+                val bytes = pendingInput.poll() ?: break
+                emulator.write(bytes)
             }
         }
-        // Consume any new scrollback lines into our local buffer.
-        scrollbackLines.addAll(emulator.takePendingScrollback())
-        if (scrollOffset != 0) {
-            // Keep the user pinned to the bottom of the live stream while scrolled.
-            // (Do nothing; user is intentionally browsing history.)
-        }
+        // The emulator owns rendered history. Draining pending lines prevents
+        // an unbounded backlog when this view is detached or paused.
+        emulator.takePendingScrollback()
+        val maxOffset = emulator.scrollbackRowCount().coerceAtLeast(0)
+        scrollOffset = scrollOffset.coerceIn(0, maxOffset)
         invalidate()
     }
 
     private fun recomputeMetrics() {
-        val textSize = 14f * resources.displayMetrics.scaledDensity
+        val density = resources.displayMetrics
+        val textSize = 14f * density.density * resources.configuration.fontScale
         paint.textSize = textSize
-        val fm = paint.fontMetrics
-        charHeight = (fm.descent - fm.ascent).coerceAtLeast(textSize)
-        fontAscent = -fm.ascent
-        charWidth = paint.measureText("M")
-        // Resize the emulator grid to fit the view.
-        if (::emulator.isInitialized && width > 0 && height > 0) {
-            val newCols = max(20, (width / charWidth).toInt())
-            val newRows = max(4, (height / charHeight).toInt())
-            if (newCols != emulator.width() || newRows != emulator.height()) {
-                emulator.resize(newCols, newRows)
-            }
+        val metrics = paint.fontMetrics
+        charHeight = (metrics.descent - metrics.ascent).coerceAtLeast(textSize)
+        fontAscent = -metrics.ascent
+        charWidth = max(1f, paint.measureText("M"))
+        if (!::emulator.isInitialized || width <= 0 || height <= 0) return
+        val cols = max(20, width / charWidth.toInt())
+        val rows = max(4, height / charHeight.toInt())
+        if (cols != emulator.width() || rows != emulator.height()) {
+            emulator.resize(cols, rows)
+            onResize?.invoke(cols, rows)
+            scrollOffset = scrollOffset.coerceIn(0, emulator.scrollbackRowCount())
         }
+        invalidate()
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        recomputeMetrics()
+        if (w > 0 && h > 0) recomputeMetrics()
     }
-
-    // ------------------------------------------------------------------ render
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (!::emulator.isInitialized) return
+        backgroundPaint.color = PALETTE[TerminalEmulator.DEFAULT_BG]
+        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), backgroundPaint)
 
         val cols = emulator.width()
         val rows = emulator.height()
-
-        // Background.
-        bgPaint.color = PALETTE[TerminalEmulator.DEFAULT_BG]
-        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
-
-        // Render scrollback (above the live screen) if scrolled up.
-        val visibleRows = rows
-        var rowIndex = -scrollOffset // index of the first visible line in (scrollback + screen)
-
-        // Compute total lines = scrollbackLines.size + rows.
-        val totalLines = scrollbackLines.size + rows
-        // Clamp scroll offset.
-        scrollOffset = scrollOffset.coerceIn(0, (totalLines - rows).coerceAtLeast(0))
-
-        // Paint each visible line.
-        for (screenRow in 0 until visibleRows) {
-            val lineIdx = rowIndex + screenRow
+        val history = emulator.scrollbackRowCount()
+        val first = (history - scrollOffset).coerceAtLeast(0)
+        for (screenRow in 0 until rows) {
+            val line = first + screenRow
+            if (line >= history + rows) break
             val y = screenRow * charHeight
-            var x = 0f
-            if (lineIdx < 0) continue
-            if (lineIdx < scrollbackLines.size) {
-                // Scrollback line.
-                val line = scrollbackLines[lineIdx]
-                for (c in 0 until minOf(cols, line.size)) {
-                    drawCell(canvas, line[c], x, y)
-                    x += charWidth
-                }
+            if (line < history) {
+                val source = emulator.scrollbackLine(line)
+                for (col in 0 until minOf(cols, source.size)) drawCell(canvas, source[col], col * charWidth, y)
             } else {
-                val gridRow = lineIdx - scrollbackLines.size
-                if (gridRow in 0 until rows) {
-                    for (c in 0 until cols) {
-                        drawCell(canvas, emulator.cell(gridRow, c), x, y)
-                        x += charWidth
-                    }
-                }
+                val gridRow = line - history
+                for (col in 0 until cols) drawCell(canvas, emulator.cell(gridRow, col), col * charWidth, y)
             }
         }
-
-        // Cursor (only when scrolled to live view).
         if (scrollOffset == 0 && cursorVisible && hasFocus()) {
-            val cx = emulator.cursorCol * charWidth
-            val cy = emulator.cursorRow * charHeight
             paint.color = PALETTE[TerminalEmulator.DEFAULT_FG]
             paint.style = Paint.Style.FILL
-            // Draw a thin block cursor (a filled rect the size of one cell).
-            canvas.drawRect(cx, cy, cx + charWidth, cy + charHeight, paint)
+            canvas.drawRect(emulator.cursorCol * charWidth, emulator.cursorRow * charHeight,
+                (emulator.cursorCol + 1) * charWidth, (emulator.cursorRow + 1) * charHeight, paint)
         }
     }
 
     private fun drawCell(canvas: Canvas, cell: TerminalEmulator.Cell, x: Float, y: Float) {
-        val bg = PALETTE[cell.bg]
-        val fg = PALETTE[cell.fg]
-        // Only paint bg when it differs from the default (perf micro-optimization).
-        if (bg != PALETTE[TerminalEmulator.DEFAULT_BG]) {
-            bgPaint.color = bg
-            canvas.drawRect(x, y, x + charWidth, y + charHeight, bgPaint)
+        val foreground = PALETTE[cell.fg]
+        val background = PALETTE[cell.bg]
+        if (background != PALETTE[TerminalEmulator.DEFAULT_BG]) {
+            backgroundPaint.color = background
+            canvas.drawRect(x, y, x + charWidth, y + charHeight, backgroundPaint)
         }
         if (cell.ch != ' ') {
-            paint.color = fg
+            paint.color = if (cell.bold && foreground == PALETTE[TerminalEmulator.DEFAULT_FG]) Color.WHITE else foreground
+            paint.style = Paint.Style.FILL
             canvas.drawText(cell.ch.toString(), x, y + fontAscent, paint)
         }
     }
 
-    // ------------------------------------------------------------------ input
-
-    /** Public: used by MainActivity's Back handler. */
     fun toggleKeyboard() {
-        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        if (imm.isActive(this)) {
-            imm.hideSoftInputFromWindow(windowToken, 0)
-        } else {
-            imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
-        }
+        val manager = inputMethodManager
+        if (manager == null) return
+        if (manager.isActive(this)) manager.hideSoftInputFromWindow(windowToken, 0)
+        else showKeyboard()
+    }
+
+    private fun showKeyboard() {
+        requestFocus()
+        inputMethodManager?.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
     }
 
     override fun onCheckIsTextEditor(): Boolean = true
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
-        outAttrs.inputType = EditorInfo.TYPE_NULL
-        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or
-            EditorInfo.IME_FLAG_NO_FULLSCREEN or
-            EditorInfo.IME_ACTION_NONE
+        outAttrs.inputType = 0
+        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
         return object : BaseInputConnection(this, false) {
-            override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
-                emulator.write(text.toString())
-                // Echo handled by the PTY (child echoes back). For pipe fallback,
-                // the parent must echo; we detect that case via emulator type.
-                return true
+            override fun commitText(text: CharSequence, cursor: Int): Boolean {
+                sendToChild(TerminalKeys.text(text.toString())); return true
             }
-
-            override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
-                // Backspace key from the IME.
-                emulator.write("\b")
-                return true
-            }
-
             override fun sendKeyEvent(event: KeyEvent): Boolean {
-                if (event.action == KeyEvent.ACTION_DOWN) {
-                    when (event.keyCode) {
-                        KeyEvent.KEYCODE_ENTER -> emulator.write("\r")
-                        KeyEvent.KEYCODE_DEL -> emulator.write("\b")
-                        else -> {
-                            val ch = event.unicodeChar
-                            if (ch != 0) emulator.write(ch.toChar().toString())
-                        }
-                    }
-                }
-                return true
+                val key = TerminalKeys.key(event)
+                if (key != null) sendToChild(key)
+                return key != null || super.sendKeyEvent(event)
+            }
+            override fun deleteSurroundingText(before: Int, after: Int): Boolean {
+                sendToChild(byteArrayOf(8)); return true
             }
         }
     }
 
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        val bytes = TerminalKeys.key(event) ?: return super.onKeyDown(keyCode, event)
+        sendToChild(bytes)
+        return true
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN && (event.isCtrlPressed || event.isAltPressed)) {
+            val bytes = TerminalKeys.key(event)
+            if (bytes != null) { sendToChild(bytes); return true }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    private fun sendToChild(data: ByteArray) {
+        if (data.isEmpty()) return
+        onInput?.invoke(data)
+        scrollOffset = 0
+        invalidate()
+    }
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (!::emulator.isInitialized) return false
+        parent?.requestDisallowInterceptTouchEvent(true)
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                requestFocus()
-                val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-                imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+                touchDownY = event.y; lastTouchY = event.y; dragging = false
                 return true
             }
-            MotionEvent.ACTION_UP -> {
-                performClick()
+            MotionEvent.ACTION_MOVE -> {
+                val delta = lastTouchY - event.y
+                if (abs(event.y - touchDownY) > touchSlop) dragging = true
+                if (abs(delta) >= charHeight) {
+                    val lines = (delta / charHeight).toInt()
+                    if (lines != 0) {
+                        val maxOffset = emulator.scrollbackRowCount()
+                        scrollOffset = (scrollOffset + lines).coerceIn(0, maxOffset)
+                        lastTouchY += lines * charHeight
+                        invalidate()
+                    }
+                }
                 return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                parent?.requestDisallowInterceptTouchEvent(false)
+                if (!dragging && event.actionMasked == MotionEvent.ACTION_UP) {
+                    performClick()
+                    showKeyboard()
+                }
+                return true
+            }
+            MotionEvent.ACTION_SCROLL -> {
+                val maxOffset = emulator.scrollbackRowCount()
+                scrollOffset = (scrollOffset - event.getAxisValue(MotionEvent.AXIS_VSCROLL) * 3)
+                    .toInt().coerceIn(0, maxOffset)
+                invalidate(); return true
             }
         }
         return super.onTouchEvent(event)
     }
 
-    override fun performClick(): Boolean {
-        super.performClick()
-        return true
-    }
-
-    // ------------------------------------------------------------------ lifecycle
+    override fun performClick(): Boolean { super.performClick(); return true }
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        post(blinkRunnable)
+        post(blink)
     }
 
     override fun onDetachedFromWindow() {
+        removeCallbacks(blink)
         super.onDetachedFromWindow()
-        removeCallbacks(blinkRunnable)
     }
 }

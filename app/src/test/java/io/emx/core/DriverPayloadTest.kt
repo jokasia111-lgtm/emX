@@ -61,6 +61,8 @@ class DriverPayloadTest {
     @Test
     fun extractPreservesLayoutAndModes() {
         val tmp = createTempDir(prefix = "emxtest")
+        org.junit.Assume.assumeTrue("Exact Unix modes require a POSIX filesystem",
+            java.nio.file.Files.getFileStore(tmp.toPath()).supportsFileAttributeView("posix"))
         val extracted = File(tmp, "extracted")
         val zipBytes = makeZip(MODE_755)
         val result = DriverPayload.extract(zipBytes.inputStream(), extracted)
